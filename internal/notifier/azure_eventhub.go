@@ -17,62 +17,100 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
-	"github.com/Azure/azure-amqp-common-go/v4/auth"
-	eventhub "github.com/Azure/azure-event-hubs-go/v3"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs"
 	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 // AzureEventHub holds the eventhub client
 type AzureEventHub struct {
-	Hub *eventhub.Hub
+	ProducerClient *azeventhubs.ProducerClient
 }
 
 // NewAzureEventHub creates a eventhub client
 func NewAzureEventHub(endpointURL, token, eventHubNamespace string) (*AzureEventHub, error) {
-	var hub *eventhub.Hub
 	var err error
+	var producer *azeventhubs.ProducerClient
 
 	// token should only be defined if JWT is used
 	if token != "" {
-		hub, err = newJWTHub(endpointURL, token, eventHubNamespace)
+		tokenProvider := NewJWTProvider(token)
+
+		producer, err = azeventhubs.NewProducerClient(eventHubNamespace, endpointURL, tokenProvider, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create a eventhub using JWT %v", err)
 		}
 	} else {
-		hub, err = newSASHub(endpointURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create a eventhub using SAS %v", err)
+		// if SharedAccessKey string is present in the endpoint URL use SAS string for authentication
+		if strings.Contains(endpointURL, "SharedAccessKey") {
+			producer, err = azeventhubs.NewProducerClientFromConnectionString(endpointURL, "", nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create a eventhub using SAS %v", err)
+			}
+		} else {
+			defaultAzureCred, err := azidentity.NewDefaultAzureCredential(nil)
+			if err != nil {
+				return nil, err
+			}
+
+			producer, err = azeventhubs.NewProducerClient(eventHubNamespace, endpointURL, defaultAzureCred, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create a eventhub using SAS %v", err)
+			}
 		}
 	}
 
 	return &AzureEventHub{
-		Hub: hub,
+		ProducerClient: producer,
 	}, nil
 }
 
 // Post all notification-controller messages to EventHub
-func (e *AzureEventHub) Post(ctx context.Context, event eventv1.Event) error {
+func (e *AzureEventHub) Post(ctx context.Context, event eventv1.Event) (err error) {
+	defer func() {
+		closeErr := e.ProducerClient.Close(ctx)
+		if err != nil {
+			err = kerrors.NewAggregate([]error{err, closeErr})
+		} else {
+			err = closeErr
+		}
+	}()
+
 	// Skip Git commit status update event.
 	if event.HasMetadata(eventv1.MetaCommitStatusKey, eventv1.MetaCommitStatusUpdateValue) {
-		return nil
+		return
 	}
 
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("unable to marshall event: %w", err)
+		err = fmt.Errorf("unable to marshall event: %w", err)
+		return
 	}
 
-	err = e.Hub.Send(ctx, eventhub.NewEvent(eventBytes))
+	batch, err := e.ProducerClient.NewEventDataBatch(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to send msg: %w", err)
+		err = fmt.Errorf("failed to create new event data batch: %w", err)
+		return
+	}
+	err = batch.AddEventData(&azeventhubs.EventData{Body: eventBytes}, nil)
+	if err != nil {
+		err = fmt.Errorf("failed to add event data: %w", err)
+		return
 	}
 
-	err = e.Hub.Close(ctx)
+	err = e.ProducerClient.SendEventDataBatch(ctx, batch, nil)
 	if err != nil {
-		return fmt.Errorf("unable to close connection: %w", err)
+		err = fmt.Errorf("failed to send msg: %w", err)
+		return
 	}
-	return nil
+
+	return
 }
 
 // PureJWT just contains the jwt
@@ -88,31 +126,10 @@ func NewJWTProvider(jwt string) *PureJWT {
 }
 
 // GetToken uses a JWT token, we assume that we will get new tokens when needed, thus no Expiry defined
-func (j *PureJWT) GetToken(uri string) (*auth.Token, error) {
-	return &auth.Token{
-		TokenType: auth.CBSTokenTypeJWT,
+func (j *PureJWT) GetToken(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	var expiryTime time.Time
+	return azcore.AccessToken{
 		Token:     j.jwt,
-		Expiry:    "",
+		ExpiresOn: expiryTime,
 	}, nil
-}
-
-// newJWTHub used when address is a JWT token
-func newJWTHub(eventhubName, token, eventHubNamespace string) (*eventhub.Hub, error) {
-	provider := NewJWTProvider(token)
-
-	hub, err := eventhub.NewHub(eventHubNamespace, eventhubName, provider)
-	if err != nil {
-		return nil, err
-	}
-	return hub, nil
-}
-
-// newSASHub used when address is a SAS ConnectionString
-func newSASHub(address string) (*eventhub.Hub, error) {
-	hub, err := eventhub.NewHubFromConnectionString(address)
-	if err != nil {
-		return nil, err
-	}
-
-	return hub, nil
 }
